@@ -250,6 +250,9 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 	}
 
 	if !dryRun {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return err
+		}
 		if err := maildir.Dir(path).Init(); err != nil {
 			return err
 		}
@@ -287,7 +290,8 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 			}
 			reader := msg.GetBody(section)
 			if reader == nil {
-				return fmt.Errorf("uid %d: empty body", msg.Uid)
+				logf("%s: uid %d: empty body (skipping)", name, msg.Uid)
+				continue
 			}
 			if err := writeMessage(path, reader, msg.Flags); err != nil {
 				return fmt.Errorf("uid %d: %w", msg.Uid, err)
