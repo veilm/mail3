@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -20,11 +19,21 @@ import (
 	"github.com/emersion/go-maildir"
 )
 
-type Account struct {
-	Address   string
-	PassEntry string
-	Host      string
-	Port      int
+type Config struct {
+	Root     string          `json:"root"`
+	Accounts []AccountConfig `json:"accounts"`
+}
+
+type AccountConfig struct {
+	Name             string   `json:"name"`
+	Address          string   `json:"address"`
+	Username         string   `json:"username"`
+	Host             string   `json:"host"`
+	Port             int      `json:"port"`
+	PasswordCommand  []string `json:"password_command"`
+	Disabled         bool     `json:"disabled"`
+	InboxOnly        bool     `json:"inbox_only"`
+	ExcludeMailboxes []string `json:"exclude_mailboxes"`
 }
 
 type MailboxState struct {
@@ -41,101 +50,149 @@ type MailboxInfo struct {
 	Delimiter string
 }
 
+type NewMessage struct {
+	Account string
+	Mailbox string
+	UID     uint32
+	Subject string
+	From    string
+}
+
+var quiet bool
+
 func main() {
+	if len(os.Args) == 1 {
+		printHelp()
+		return
+	}
+
+	switch os.Args[1] {
+	case "-h", "--help", "help":
+		printHelp()
+		return
+	case "sync":
+		runSync(os.Args[2:])
+		return
+	default:
+		printHelp()
+		os.Exit(2)
+	}
+}
+
+func printHelp() {
+	fmt.Println(`mail3 - minimal IMAP to Maildir puller
+
+Usage:
+  mail3 sync [options]
+  mail3 --help
+
+Sync options:
+  -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
+  -root PATH          Override root maildir path
+  -list-unread        Print only list of new unread mail
+  -dry-run            List actions without writing maildir
+  -account NAME       Only sync a specific account (repeatable)
+`)
+}
+
+func runSync(args []string) {
+	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	var configPath string
-	var rootMailDir string
-	var inboxOnly bool
+	var rootOverride string
+	var listUnread bool
 	var dryRun bool
-	var skipNetC bool
+	accountFilters := stringSlice{}
+	fs.StringVar(&configPath, "config", "", "config path")
+	fs.StringVar(&rootOverride, "root", "", "root maildir path override")
+	fs.BoolVar(&listUnread, "list-unread", false, "list only new unread mail")
+	fs.BoolVar(&dryRun, "dry-run", false, "dry run")
+	fs.Var(&accountFilters, "account", "account name to sync (repeatable)")
+	_ = fs.Parse(args)
 
-	excluded := make(map[string]bool)
-	flag.Func("exclude", "Mailbox name to exclude (can be repeated)", func(value string) error {
-		excluded[value] = true
-		return nil
-	})
+	if listUnread {
+		quiet = true
+	}
 
-	flag.StringVar(&configPath, "config", "", "Config file path (defaults to $XDG_CONFIG_HOME/msk/misc/mail2)")
-	flag.StringVar(&rootMailDir, "root", "", "Root maildir path (defaults to $XDG_DATA_HOME/mail)")
-	flag.BoolVar(&inboxOnly, "inbox-only", false, "Only sync INBOX")
-	flag.BoolVar(&dryRun, "dry-run", false, "List actions without writing maildir")
-	flag.BoolVar(&skipNetC, "skip-net-c", true, "Skip net-c.com account")
-	flag.Parse()
-
-	if configPath == "" {
+	cfgPath := configPath
+	if cfgPath == "" {
 		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
 		if xdgConfig == "" {
 			fatalf("XDG_CONFIG_HOME is not set; pass -config")
 		}
-		configPath = filepath.Join(xdgConfig, "msk", "misc", "mail2")
+		cfgPath = filepath.Join(xdgConfig, "mail3", "config.json")
 	}
 
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+
+	rootMailDir := cfg.Root
+	if rootOverride != "" {
+		rootMailDir = rootOverride
+	}
 	if rootMailDir == "" {
 		xdgData := os.Getenv("XDG_DATA_HOME")
 		if xdgData == "" {
-			fatalf("XDG_DATA_HOME is not set; pass -root")
+			fatalf("XDG_DATA_HOME is not set; pass -root or set root in config")
 		}
 		rootMailDir = filepath.Join(xdgData, "mail3")
 	}
 
-	if len(excluded) == 0 {
-		excluded["[Gmail]/All Mail"] = true
+	filters := make(map[string]bool)
+	for _, name := range accountFilters {
+		filters[name] = true
 	}
 
-	accounts, err := loadAccounts(configPath)
-	if err != nil {
-		fatalf("load accounts: %v", err)
-	}
-
-	for _, acct := range accounts {
-		if skipNetC && strings.Contains(acct.Address, "net-c.com") {
-			logf("skip %s (net-c.com)", acct.Address)
+	var unread []NewMessage
+	for _, acct := range cfg.Accounts {
+		if acct.Disabled {
+			logf("skip %s (disabled)", acct.Name)
 			continue
 		}
-		if err := syncAccount(acct, rootMailDir, inboxOnly, dryRun, excluded); err != nil {
-			logf("account %s: %v", acct.Address, err)
+		if len(filters) > 0 && !filters[acct.Name] {
+			continue
+		}
+		msgs, err := syncAccount(acct, rootMailDir, dryRun)
+		if err != nil {
+			logf("account %s: %v", acct.Name, err)
+			continue
+		}
+		unread = append(unread, msgs...)
+	}
+
+	if listUnread {
+		for _, msg := range unread {
+			fmt.Printf("%s\t%s\t%v\t%s\t%s\n", msg.Account, msg.Mailbox, msg.UID, msg.From, msg.Subject)
 		}
 	}
 }
 
-func loadAccounts(path string) ([]Account, error) {
+func loadConfig(path string) (Config, error) {
+	var cfg Config
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return cfg, err
 	}
 	defer file.Close()
 
-	var accounts []Account
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			return nil, fmt.Errorf("invalid account line: %q", line)
-		}
-		port, err := strconv.Atoi(fields[3])
-		if err != nil {
-			return nil, fmt.Errorf("invalid port in line: %q", line)
-		}
-		accounts = append(accounts, Account{
-			Address:   fields[0],
-			PassEntry: fields[1],
-			Host:      fields[2],
-			Port:      port,
-		})
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		return cfg, err
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return accounts, nil
+	return cfg, nil
 }
 
-func syncAccount(acct Account, rootMailDir string, inboxOnly, dryRun bool, excluded map[string]bool) error {
-	pass, err := readPassword(acct.PassEntry)
+func syncAccount(acct AccountConfig, rootMailDir string, dryRun bool) ([]NewMessage, error) {
+	if acct.Address == "" || acct.Username == "" || acct.Host == "" || acct.Port == 0 {
+		return nil, fmt.Errorf("account %s: missing required fields", acct.Name)
+	}
+	if len(acct.PasswordCommand) == 0 {
+		return nil, fmt.Errorf("account %s: password_command is required", acct.Name)
+	}
+
+	pass, err := readPassword(acct.PasswordCommand)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	addr := fmt.Sprintf("%s:%d", acct.Host, acct.Port)
@@ -144,42 +201,55 @@ func syncAccount(acct Account, rootMailDir string, inboxOnly, dryRun bool, exclu
 	tlsConfig := &tls.Config{ServerName: acct.Host}
 	c, err := client.DialTLS(addr, tlsConfig)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer c.Logout()
 
-	if err := c.Login(acct.Address, pass); err != nil {
-		return err
+	if err := c.Login(acct.Username, pass); err != nil {
+		return nil, err
 	}
 
-	mailboxes, err := listMailboxes(c, inboxOnly, excluded)
+	excluded := make(map[string]bool)
+	for _, name := range acct.ExcludeMailboxes {
+		excluded[name] = true
+	}
+
+	mailboxes, err := listMailboxes(c, acct.InboxOnly, excluded)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	acctRoot := filepath.Join(rootMailDir, acct.Address)
 	if err := os.MkdirAll(acctRoot, 0o700); err != nil {
-		return err
+		return nil, err
 	}
 
 	statePath := filepath.Join(acctRoot, ".mail3_state.json")
 	state, err := loadState(statePath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var unread []NewMessage
 	for _, mbox := range mailboxes {
 		mboxPath := mailboxPath(acctRoot, mbox.Name, mbox.Delimiter)
-		if err := syncMailbox(c, mbox.Name, mboxPath, dryRun, &state); err != nil {
+		msgs, err := syncMailbox(c, mbox.Name, mboxPath, dryRun, &state)
+		if err != nil {
 			logf("%s/%s: %v", acct.Address, mbox.Name, err)
+			continue
+		}
+		for _, msg := range msgs {
+			msg.Account = acct.Name
+			msg.Mailbox = mbox.Name
+			unread = append(unread, msg)
 		}
 	}
 
 	if err := saveState(statePath, state); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return unread, nil
 }
 
 func listMailboxes(c *client.Client, inboxOnly bool, excluded map[string]bool) ([]MailboxInfo, error) {
@@ -221,11 +291,11 @@ func canOpen(mbox *imap.MailboxInfo) bool {
 	return true
 }
 
-func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State) error {
+func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State) ([]NewMessage, error) {
 	logf("sync %s", name)
 	mbox, err := c.Select(name, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	mboxState := state.Mailboxes[name]
@@ -242,19 +312,19 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 
 	uids, err := c.UidSearch(criteria)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(uids) == 0 {
 		state.Mailboxes[name] = mboxState
-		return nil
+		return nil, nil
 	}
 
 	if !dryRun {
 		if err := os.MkdirAll(path, 0o700); err != nil {
-			return err
+			return nil, err
 		}
 		if err := maildir.Dir(path).Init(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -263,6 +333,7 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 
 	const batchSize = 50
 	var maxUID uint32 = mboxState.LastUID
+	var unread []NewMessage
 	for i := 0; i < len(uids); i += batchSize {
 		end := i + batchSize
 		if end > len(uids) {
@@ -293,43 +364,92 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 				logf("%s: uid %d: empty body (skipping)", name, msg.Uid)
 				continue
 			}
-			if err := writeMessage(path, reader, msg.Flags); err != nil {
-				return fmt.Errorf("uid %d: %w", msg.Uid, err)
+			subject, from, err := writeMessage(path, reader, msg.Flags)
+			if err != nil {
+				return nil, fmt.Errorf("uid %d: %w", msg.Uid, err)
+			}
+			if !hasSeen(msg.Flags) {
+				unread = append(unread, NewMessage{UID: msg.Uid, Subject: subject, From: from})
 			}
 		}
 
 		if err := <-done; err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	mboxState.LastUID = maxUID
 	state.Mailboxes[name] = mboxState
-	return nil
+	return unread, nil
 }
 
-func writeMessage(dir string, r io.Reader, imapFlags []string) error {
+func hasSeen(flags []string) bool {
+	for _, flag := range flags {
+		if flag == imap.SeenFlag {
+			return true
+		}
+	}
+	return false
+}
+
+func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, error) {
 	dest := maildir.Dir(dir)
 	flags := imapFlagsToMaildir(imapFlags)
+
 	var writer io.WriteCloser
 	if len(flags) == 0 {
 		del, err := maildir.NewDelivery(dir)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 		writer = del
 	} else {
 		_, w, err := dest.Create(flags)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 		writer = w
 	}
 	defer writer.Close()
-	if _, err := io.Copy(writer, r); err != nil {
-		return err
+
+	br := bufio.NewReader(r)
+	subject := ""
+	from := ""
+
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", "", err
+		}
+		if line == "\n" || line == "\r\n" || err != nil {
+			if _, werr := io.WriteString(writer, line); werr != nil {
+				return "", "", werr
+			}
+			if err == nil {
+				if _, cerr := io.Copy(writer, br); cerr != nil {
+					return "", "", cerr
+				}
+			}
+			break
+		}
+
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "subject:") && subject == "" {
+			subject = strings.TrimSpace(line[len("Subject:"):])
+		} else if strings.HasPrefix(lower, "from:") && from == "" {
+			from = strings.TrimSpace(line[len("From:"):])
+		}
+
+		if _, werr := io.WriteString(writer, line); werr != nil {
+			return "", "", werr
+		}
+
+		if err != nil {
+			break
+		}
 	}
-	return nil
+
+	return subject, from, nil
 }
 
 func imapFlagsToMaildir(flags []string) []maildir.Flag {
@@ -396,20 +516,34 @@ func saveState(path string, state State) error {
 	return os.Rename(tmp, path)
 }
 
-func readPassword(entry string) (string, error) {
-	cmd := exec.Command("msk_pass", "get", entry)
+func readPassword(command []string) (string, error) {
+	cmd := exec.Command(command[0], command[1:]...)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("msk_pass get %s: %w", entry, err)
+		return "", fmt.Errorf("password command %q failed: %w", strings.Join(command, " "), err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
 func logf(format string, args ...any) {
+	if quiet {
+		return
+	}
 	fmt.Printf(format+"\n", args...)
 }
 
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+type stringSlice []string
+
+func (s *stringSlice) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSlice) Set(value string) error {
+	*s = append(*s, value)
+	return nil
 }
