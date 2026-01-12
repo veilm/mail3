@@ -4,6 +4,9 @@ Minimal IMAP-to-Maildir puller using go-imap (same IMAP library aerc uses).
 
 ## Usage
 
+- `mail3 check`
+- `mail3 check -binary`
+- `mail3 check -inbox-only`
 - `mail3 --help`
 - `mail3 sync`
 - `mail3 sync -list-unread`
@@ -58,3 +61,4 @@ Fields:
 
 - Pull-only: this does not push changes back to the server.
 - New/unread listing uses the IMAP \Seen flag and only reports messages fetched in the current run.
+- `check` uses IMAP STATUS to query unseen counts without selecting mailboxes or fetching message bodies.

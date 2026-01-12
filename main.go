@@ -71,6 +71,9 @@ func main() {
 	case "-h", "--help", "help":
 		printHelp()
 		return
+	case "check":
+		runCheck(os.Args[2:])
+		return
 	case "sync":
 		runSync(os.Args[2:])
 		return
@@ -84,8 +87,15 @@ func printHelp() {
 	fmt.Println(`mail3 - minimal IMAP to Maildir puller
 
 Usage:
+  mail3 check [options]
   mail3 sync [options]
   mail3 --help
+
+Check options:
+  -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
+  -binary             Print 1 if any unread mail exists, otherwise 0
+  -inbox-only         Only check INBOX for each account
+  -account NAME       Only check a specific account (repeatable)
 
 Sync options:
   -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
@@ -578,4 +588,132 @@ func (s *stringSlice) String() string {
 func (s *stringSlice) Set(value string) error {
 	*s = append(*s, value)
 	return nil
+}
+
+type UnseenResult struct {
+	Account string
+	Mailbox string
+	Unseen  uint32
+}
+
+func runCheck(args []string) {
+	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	var configPath string
+	var binary bool
+	var inboxOnly bool
+	accountFilters := stringSlice{}
+	fs.StringVar(&configPath, "config", "", "config path")
+	fs.BoolVar(&binary, "binary", false, "print 1 if any unread mail exists, otherwise 0")
+	fs.BoolVar(&inboxOnly, "inbox-only", false, "only check INBOX for each account")
+	fs.Var(&accountFilters, "account", "account name to check (repeatable)")
+	_ = fs.Parse(args)
+
+	cfgPath := configPath
+	if cfgPath == "" {
+		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+		if xdgConfig == "" {
+			fatalf("XDG_CONFIG_HOME is not set; pass -config")
+		}
+		cfgPath = filepath.Join(xdgConfig, "mail3", "config.json")
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+
+	filters := make(map[string]bool)
+	for _, name := range accountFilters {
+		filters[name] = true
+	}
+
+	var results []UnseenResult
+	var total uint32
+	for _, acct := range cfg.Accounts {
+		if acct.Disabled {
+			continue
+		}
+		if len(filters) > 0 && !filters[acct.Name] {
+			continue
+		}
+		if inboxOnly {
+			acct.InboxOnly = true
+		}
+		unseen, err := checkAccount(acct)
+		if err != nil {
+			logf("account %s: %v", acct.Name, err)
+			continue
+		}
+		for _, res := range unseen {
+			if binary && res.Unseen > 0 {
+				fmt.Println("1")
+				return
+			}
+			results = append(results, res)
+			total += res.Unseen
+		}
+	}
+
+	if binary {
+		fmt.Println("0")
+		return
+	}
+
+	for _, res := range results {
+		fmt.Printf("%s\t%s\t%d\n", res.Account, res.Mailbox, res.Unseen)
+	}
+	fmt.Printf("total\t%d\n", total)
+}
+
+func checkAccount(acct AccountConfig) ([]UnseenResult, error) {
+	if acct.Address == "" || acct.Username == "" || acct.Host == "" || acct.Port == 0 {
+		return nil, fmt.Errorf("account %s: missing required fields", acct.Name)
+	}
+	if len(acct.PasswordCommand) == 0 {
+		return nil, fmt.Errorf("account %s: password_command is required", acct.Name)
+	}
+
+	pass, err := readPassword(acct.PasswordCommand)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := fmt.Sprintf("%s:%d", acct.Host, acct.Port)
+	tlsConfig := &tls.Config{ServerName: acct.Host}
+	c, err := client.DialTLS(addr, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Logout()
+
+	if err := c.Login(acct.Username, pass); err != nil {
+		return nil, err
+	}
+
+	excluded := make(map[string]bool)
+	for _, name := range acct.ExcludeMailboxes {
+		excluded[name] = true
+	}
+
+	mailboxes, err := listMailboxes(c, acct.InboxOnly, excluded)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []UnseenResult
+	for _, mbox := range mailboxes {
+		status, err := c.Status(mbox.Name, []imap.StatusItem{imap.StatusUnseen})
+		if err != nil {
+			return nil, err
+		}
+		if status.Unseen > 0 {
+			out = append(out, UnseenResult{
+				Account: acct.Name,
+				Mailbox: mbox.Name,
+				Unseen:  status.Unseen,
+			})
+		}
+	}
+
+	return out, nil
 }
