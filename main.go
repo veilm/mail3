@@ -59,6 +59,7 @@ type NewMessage struct {
 }
 
 var quiet bool
+var trace bool
 
 func main() {
 	if len(os.Args) == 1 {
@@ -106,6 +107,7 @@ func runSync(args []string) {
 	fs.StringVar(&rootOverride, "root", "", "root maildir path override")
 	fs.BoolVar(&listUnread, "list-unread", false, "list only new unread mail")
 	fs.BoolVar(&dryRun, "dry-run", false, "dry run")
+	fs.BoolVar(&trace, "trace", false, "print timing per mailbox to stderr")
 	fs.Var(&accountFilters, "account", "account name to sync (repeatable)")
 	_ = fs.Parse(args)
 
@@ -145,6 +147,7 @@ func runSync(args []string) {
 	}
 
 	var unread []NewMessage
+	startAll := time.Now()
 	for _, acct := range cfg.Accounts {
 		if acct.Disabled {
 			logf("skip %s (disabled)", acct.Name)
@@ -153,13 +156,16 @@ func runSync(args []string) {
 		if len(filters) > 0 && !filters[acct.Name] {
 			continue
 		}
+		startAcct := time.Now()
 		msgs, err := syncAccount(acct, rootMailDir, dryRun)
 		if err != nil {
 			logf("account %s: %v", acct.Name, err)
 			continue
 		}
+		tracef("account %s: %s", acct.Name, time.Since(startAcct))
 		unread = append(unread, msgs...)
 	}
+	tracef("total: %s", time.Since(startAll))
 
 	if listUnread {
 		for _, msg := range unread {
@@ -233,11 +239,13 @@ func syncAccount(acct AccountConfig, rootMailDir string, dryRun bool) ([]NewMess
 	var unread []NewMessage
 	for _, mbox := range mailboxes {
 		mboxPath := mailboxPath(acctRoot, mbox.Name, mbox.Delimiter)
+		startMbox := time.Now()
 		msgs, err := syncMailbox(c, mbox.Name, mboxPath, dryRun, &state)
 		if err != nil {
 			logf("%s/%s: %v", acct.Address, mbox.Name, err)
 			continue
 		}
+		tracef("mailbox %s/%s: %s", acct.Name, mbox.Name, time.Since(startMbox))
 		for _, msg := range msgs {
 			msg.Account = acct.Name
 			msg.Mailbox = mbox.Name
@@ -297,6 +305,7 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 	if err != nil {
 		return nil, err
 	}
+	tracef("mailbox %s: uidvalidity=%d uidnext=%d", name, mbox.UidValidity, mbox.UidNext)
 
 	mboxState := state.Mailboxes[name]
 	if mbox.UidValidity != 0 && mboxState.UIDValidity != 0 && mboxState.UIDValidity != mbox.UidValidity {
@@ -314,6 +323,7 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 	if err != nil {
 		return nil, err
 	}
+	tracef("mailbox %s: last_uid=%d new=%d", name, mboxState.LastUID, len(uids))
 	if len(uids) == 0 {
 		state.Mailboxes[name] = mboxState
 		return nil, nil
@@ -328,12 +338,13 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 		}
 	}
 
-	section := &imap.BodySectionName{}
+	section := &imap.BodySectionName{Peek: true}
 	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, section.FetchItem()}
 
 	const batchSize = 50
 	var maxUID uint32 = mboxState.LastUID
 	var unread []NewMessage
+	var bytesFetched int64
 	for i := 0; i < len(uids); i += batchSize {
 		end := i + batchSize
 		if end > len(uids) {
@@ -364,10 +375,12 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 				logf("%s: uid %d: empty body (skipping)", name, msg.Uid)
 				continue
 			}
-			subject, from, err := writeMessage(path, reader, msg.Flags)
+			counter := &countingReader{r: reader}
+			subject, from, err := writeMessage(path, counter, msg.Flags)
 			if err != nil {
 				return nil, fmt.Errorf("uid %d: %w", msg.Uid, err)
 			}
+			bytesFetched += counter.n
 			if !hasSeen(msg.Flags) {
 				unread = append(unread, NewMessage{UID: msg.Uid, Subject: subject, From: from})
 			}
@@ -380,6 +393,7 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 
 	mboxState.LastUID = maxUID
 	state.Mailboxes[name] = mboxState
+	tracef("mailbox %s: fetched_bytes=%d", name, bytesFetched)
 	return unread, nil
 }
 
@@ -530,6 +544,24 @@ func logf(format string, args ...any) {
 		return
 	}
 	fmt.Printf(format+"\n", args...)
+}
+
+func tracef(format string, args ...any) {
+	if !trace {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func fatalf(format string, args ...any) {
