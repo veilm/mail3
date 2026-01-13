@@ -9,7 +9,7 @@ Minimal IMAP-to-Maildir puller using go-imap (same IMAP library aerc uses).
 - `mail3 check -inbox-only`
 - `mail3 --help`
 - `mail3 sync`
-- `mail3 sync -list-unread`
+- `mail3 sync -get-unread`
 - `mail3 sync -account 1411 -account ms2`
 
 By default, config is read from `$XDG_CONFIG_HOME/mail3/config.json` and mail is stored under `$XDG_DATA_HOME/mail3`.
@@ -61,4 +61,5 @@ Fields:
 
 - Pull-only: this does not push changes back to the server.
 - New/unread listing uses the IMAP \Seen flag and only reports messages fetched in the current run.
+- `-get-unread` prints nothing and exits 1 when no unread mail was fetched.
 - `check` uses IMAP STATUS to query unseen counts without selecting mailboxes or fetching message bodies.
