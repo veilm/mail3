@@ -101,6 +101,7 @@ Sync options:
   -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
   -root PATH          Override root maildir path
   -get-unread         Print only list of new unread mail; exit 1 if none
+  -unique             Deduplicate unread output by account+from+subject
   -dry-run            List actions without writing maildir
   -account NAME       Only sync a specific account (repeatable)
 `)
@@ -111,11 +112,13 @@ func runSync(args []string) {
 	var configPath string
 	var rootOverride string
 	var listUnread bool
+	var uniqueUnread bool
 	var dryRun bool
 	accountFilters := stringSlice{}
 	fs.StringVar(&configPath, "config", "", "config path")
 	fs.StringVar(&rootOverride, "root", "", "root maildir path override")
 	fs.BoolVar(&listUnread, "get-unread", false, "print only list of new unread mail; exit 1 if none")
+	fs.BoolVar(&uniqueUnread, "unique", false, "deduplicate unread output by account+from+subject")
 	fs.BoolVar(&dryRun, "dry-run", false, "dry run")
 	fs.BoolVar(&trace, "trace", false, "print timing per mailbox to stderr")
 	fs.Var(&accountFilters, "account", "account name to sync (repeatable)")
@@ -178,6 +181,19 @@ func runSync(args []string) {
 	tracef("total: %s", time.Since(startAll))
 
 	if listUnread {
+		if uniqueUnread {
+			seen := make(map[string]bool, len(unread))
+			unique := unread[:0]
+			for _, msg := range unread {
+				key := msg.Account + "\x00" + msg.From + "\x00" + msg.Subject
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				unique = append(unique, msg)
+			}
+			unread = unique
+		}
 		for _, msg := range unread {
 			fmt.Printf("%s\t%s\t%v\t%s\t%s\n", msg.Account, msg.Mailbox, msg.UID, msg.From, msg.Subject)
 		}
