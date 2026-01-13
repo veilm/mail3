@@ -182,7 +182,7 @@ func runSync(args []string) {
 			fmt.Printf("%s\t%s\t%v\t%s\t%s\n", msg.Account, msg.Mailbox, msg.UID, msg.From, msg.Subject)
 		}
 		if len(unread) == 0 {
-			os.Exit(1)
+			os.Exit(2)
 		}
 	}
 }
