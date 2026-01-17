@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-maildir"
+	"golang.org/x/net/html/charset"
 )
 
 type Config struct {
@@ -458,6 +460,7 @@ func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, 
 	br := bufio.NewReader(r)
 	subject := ""
 	from := ""
+	lastHeader := ""
 
 	for {
 		line, err := br.ReadString('\n')
@@ -476,11 +479,23 @@ func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, 
 			break
 		}
 
-		lower := strings.ToLower(strings.TrimSpace(line))
+		trimmed := strings.TrimRight(line, "\r\n")
+		lower := strings.ToLower(strings.TrimSpace(trimmed))
 		if strings.HasPrefix(lower, "subject:") && subject == "" {
-			subject = strings.TrimSpace(line[len("Subject:"):])
+			subject = strings.TrimSpace(trimmed[len("Subject:"):])
+			lastHeader = "subject"
 		} else if strings.HasPrefix(lower, "from:") && from == "" {
-			from = strings.TrimSpace(line[len("From:"):])
+			from = strings.TrimSpace(trimmed[len("From:"):])
+			lastHeader = "from"
+		} else if (strings.HasPrefix(trimmed, " ") || strings.HasPrefix(trimmed, "\t")) && lastHeader != "" {
+			continuation := strings.TrimSpace(trimmed)
+			if lastHeader == "subject" && subject != "" {
+				subject = subject + " " + continuation
+			} else if lastHeader == "from" && from != "" {
+				from = from + " " + continuation
+			}
+		} else {
+			lastHeader = ""
 		}
 
 		if _, werr := io.WriteString(writer, line); werr != nil {
@@ -492,7 +507,19 @@ func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, 
 		}
 	}
 
-	return subject, from, nil
+	return decodeHeaderValue(subject), decodeHeaderValue(from), nil
+}
+
+func decodeHeaderValue(value string) string {
+	if value == "" {
+		return value
+	}
+	decoder := mime.WordDecoder{CharsetReader: charset.NewReaderLabel}
+	decoded, err := decoder.DecodeHeader(value)
+	if err != nil {
+		return value
+	}
+	return decoded
 }
 
 func imapFlagsToMaildir(flags []string) []maildir.Flag {
