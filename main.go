@@ -21,6 +21,8 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
+const uidIndexDirName = ".mail3_uid_index"
+
 type Config struct {
 	Root     string          `json:"root"`
 	Accounts []AccountConfig `json:"accounts"`
@@ -407,15 +409,18 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 				continue
 			}
 			counter := &countingReader{r: reader}
-			subject, from, err := writeMessage(path, counter, msg.Flags)
-			if err != nil {
-				return nil, fmt.Errorf("uid %d: %w", msg.Uid, err)
+				key, subject, from, err := writeMessage(path, counter, msg.Flags)
+				if err != nil {
+					return nil, fmt.Errorf("uid %d: %w", msg.Uid, err)
+				}
+				if err := replaceIndexedMessage(path, msg.Uid, key); err != nil {
+					return nil, fmt.Errorf("uid %d: %w", msg.Uid, err)
+				}
+				bytesFetched += counter.n
+				if !hasSeen(msg.Flags) {
+					unread = append(unread, NewMessage{UID: msg.Uid, Subject: subject, From: from})
+				}
 			}
-			bytesFetched += counter.n
-			if !hasSeen(msg.Flags) {
-				unread = append(unread, NewMessage{UID: msg.Uid, Subject: subject, From: from})
-			}
-		}
 
 		if err := <-done; err != nil {
 			return nil, err
@@ -437,25 +442,13 @@ func hasSeen(flags []string) bool {
 	return false
 }
 
-func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, error) {
+func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, string, error) {
 	dest := maildir.Dir(dir)
 	flags := imapFlagsToMaildir(imapFlags)
-
-	var writer io.WriteCloser
-	if len(flags) == 0 {
-		del, err := maildir.NewDelivery(dir)
-		if err != nil {
-			return "", "", err
-		}
-		writer = del
-	} else {
-		_, w, err := dest.Create(flags)
-		if err != nil {
-			return "", "", err
-		}
-		writer = w
+	msg, writer, err := dest.Create(flags)
+	if err != nil {
+		return "", "", "", err
 	}
-	defer writer.Close()
 
 	br := bufio.NewReader(r)
 	subject := ""
@@ -465,15 +458,18 @@ func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, 
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return "", "", err
+			_ = writer.Close()
+			return "", "", "", err
 		}
 		if line == "\n" || line == "\r\n" || err != nil {
 			if _, werr := io.WriteString(writer, line); werr != nil {
-				return "", "", werr
+				_ = writer.Close()
+				return "", "", "", werr
 			}
 			if err == nil {
 				if _, cerr := io.Copy(writer, br); cerr != nil {
-					return "", "", cerr
+					_ = writer.Close()
+					return "", "", "", cerr
 				}
 			}
 			break
@@ -498,16 +494,82 @@ func writeMessage(dir string, r io.Reader, imapFlags []string) (string, string, 
 			lastHeader = ""
 		}
 
-		if _, werr := io.WriteString(writer, line); werr != nil {
-			return "", "", werr
-		}
+			if _, werr := io.WriteString(writer, line); werr != nil {
+				_ = writer.Close()
+				return "", "", "", werr
+			}
 
 		if err != nil {
 			break
 		}
 	}
 
-	return decodeHeaderValue(subject), decodeHeaderValue(from), nil
+	if err := writer.Close(); err != nil {
+		return "", "", "", err
+	}
+
+	// Keep unseen messages in maildir/new (without a :2, suffix) like before.
+	if len(flags) == 0 {
+		oldPath := msg.Filename()
+		newPath := filepath.Join(dir, "new", msg.Key())
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return "", "", "", err
+		}
+	}
+
+	return msg.Key(), decodeHeaderValue(subject), decodeHeaderValue(from), nil
+}
+
+func replaceIndexedMessage(mailboxPath string, uid uint32, newKey string) error {
+	oldKey, err := readUIDIndex(mailboxPath, uid)
+	if err != nil {
+		return err
+	}
+	if err := writeUIDIndex(mailboxPath, uid, newKey); err != nil {
+		return err
+	}
+	if oldKey == "" || oldKey == newKey {
+		return nil
+	}
+
+	msg, err := maildir.Dir(mailboxPath).MessageByKey(oldKey)
+	if err == nil {
+		return msg.Remove()
+	}
+	var keyErr *maildir.KeyError
+	if errors.As(err, &keyErr) && keyErr.N == 0 {
+		return nil
+	}
+	return err
+}
+
+func uidIndexPath(mailboxPath string, uid uint32) string {
+	return filepath.Join(mailboxPath, uidIndexDirName, fmt.Sprintf("%d", uid))
+}
+
+func readUIDIndex(mailboxPath string, uid uint32) (string, error) {
+	data, err := os.ReadFile(uidIndexPath(mailboxPath, uid))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func writeUIDIndex(mailboxPath string, uid uint32, key string) error {
+	indexDir := filepath.Join(mailboxPath, uidIndexDirName)
+	if err := os.MkdirAll(indexDir, 0o700); err != nil {
+		return err
+	}
+
+	path := uidIndexPath(mailboxPath, uid)
+	tmp := fmt.Sprintf("%s.%d", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmp, []byte(key+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func decodeHeaderValue(value string) string {
