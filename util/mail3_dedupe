@@ -1,0 +1,259 @@
+#!/usr/bin/python
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class MailFile:
+    path: Path
+    rel_to_mailbox: str
+    size: int
+    mtime_ns: int
+
+
+@dataclass
+class DuplicateGroup:
+    hash_hex: str
+    size: int
+    keeper: MailFile
+    losers: list[MailFile]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Archive exact duplicate maildir messages within each mailbox."
+    )
+    parser.add_argument(
+        "--root",
+        default="/home/oboro/.local/share/mail3",
+        help="mail3 root",
+    )
+    parser.add_argument(
+        "--archive-root",
+        default="/home/oboro/.local/share/mail3-archive",
+        help="archive root",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="move duplicates into the archive instead of only reporting them",
+    )
+    parser.add_argument(
+        "--mailbox",
+        action="append",
+        default=[],
+        help="limit to a relative mailbox path under --root; may be given multiple times",
+    )
+    return parser.parse_args()
+
+
+def iter_mailboxes(root: Path, selected: set[str]) -> list[Path]:
+    out: list[Path] = []
+    for dirpath, dirnames, _filenames in os.walk(root):
+        path = Path(dirpath)
+        if path.name in {"cur", "new", "tmp", uid_index_dir_name()}:
+            dirnames[:] = []
+            continue
+        has_cur = (path / "cur").is_dir()
+        has_new = (path / "new").is_dir()
+        if not (has_cur or has_new):
+            continue
+        rel = path.relative_to(root).as_posix()
+        if selected and rel not in selected:
+            continue
+        out.append(path)
+        dirnames[:] = []
+    out.sort()
+    return out
+
+
+def uid_index_dir_name() -> str:
+    return ".mail3_uid_index"
+
+
+def list_mail_files(mailbox: Path) -> list[MailFile]:
+    out: list[MailFile] = []
+    for subdir in ("cur", "new"):
+        msg_dir = mailbox / subdir
+        if not msg_dir.is_dir():
+            continue
+        try:
+            names = sorted(msg_dir.iterdir())
+        except FileNotFoundError:
+            continue
+        for path in names:
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            out.append(
+                MailFile(
+                    path=path,
+                    rel_to_mailbox=path.relative_to(mailbox).as_posix(),
+                    size=stat.st_size,
+                    mtime_ns=stat.st_mtime_ns,
+                )
+            )
+    return out
+
+
+def hash_file(path: Path) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except FileNotFoundError:
+        return None
+    return h.hexdigest()
+
+
+def find_duplicate_groups(mailbox: Path) -> tuple[list[MailFile], list[DuplicateGroup]]:
+    files = list_mail_files(mailbox)
+    by_size: dict[int, list[MailFile]] = defaultdict(list)
+    for mf in files:
+        by_size[mf.size].append(mf)
+
+    groups: list[DuplicateGroup] = []
+    for size, same_size in sorted(by_size.items()):
+        if len(same_size) < 2:
+            continue
+        by_hash: dict[str, list[MailFile]] = defaultdict(list)
+        for mf in same_size:
+            hash_hex = hash_file(mf.path)
+            if hash_hex is None:
+                continue
+            by_hash[hash_hex].append(mf)
+        for hash_hex, dupes in by_hash.items():
+            if len(dupes) < 2:
+                continue
+            dupes.sort(key=lambda mf: (mf.mtime_ns, mf.path.name, mf.rel_to_mailbox))
+            keeper = dupes[-1]
+            losers = dupes[:-1]
+            groups.append(
+                DuplicateGroup(
+                    hash_hex=hash_hex,
+                    size=size,
+                    keeper=keeper,
+                    losers=losers,
+                )
+            )
+    groups.sort(key=lambda g: (-len(g.losers), -g.size, g.keeper.rel_to_mailbox))
+    return files, groups
+
+
+def archive_path(batch_root: Path, root: Path, path: Path) -> Path:
+    rel = path.relative_to(root)
+    return batch_root / rel
+
+
+def ensure_unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.name
+    i = 1
+    while True:
+        candidate = path.with_name(f"{stem}.dup{i}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def move_duplicates(root: Path, archive_root: Path, plan: dict[str, list[DuplicateGroup]]) -> Path:
+    batch_root = archive_root / f"exact-duplicates-{time.strftime('%Y%m%d-%H%M%S')}"
+    batch_root.mkdir(parents=True, exist_ok=False)
+    manifest_path = batch_root / "manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as manifest:
+        for mailbox_rel, groups in plan.items():
+            for group in groups:
+                for loser in group.losers:
+                    src = loser.path
+                    if not src.exists():
+                        continue
+                    dst = ensure_unique_path(archive_path(batch_root, root, src))
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    record = {
+                        "mailbox": mailbox_rel,
+                        "hash": group.hash_hex,
+                        "size": group.size,
+                        "kept": str(group.keeper.path),
+                        "archived_from": str(src),
+                        "archived_to": str(dst),
+                    }
+                    manifest.write(json.dumps(record, ensure_ascii=True) + "\n")
+    return batch_root
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.root)
+    archive_root = Path(args.archive_root)
+    selected = set(args.mailbox)
+
+    if not root.is_dir():
+        print(f"missing root: {root}", file=sys.stderr)
+        return 1
+
+    mailboxes = iter_mailboxes(root, selected)
+    if not mailboxes:
+        print("no mailboxes found", file=sys.stderr)
+        return 1
+
+    total_files = 0
+    total_dup_groups = 0
+    total_extra_files = 0
+    total_extra_bytes = 0
+    apply_plan: dict[str, list[DuplicateGroup]] = {}
+
+    for mailbox in mailboxes:
+        rel = mailbox.relative_to(root).as_posix()
+        files, groups = find_duplicate_groups(mailbox)
+        extra_files = sum(len(group.losers) for group in groups)
+        extra_bytes = sum(len(group.losers) * group.size for group in groups)
+        total_files += len(files)
+        total_dup_groups += len(groups)
+        total_extra_files += extra_files
+        total_extra_bytes += extra_bytes
+        if groups:
+            apply_plan[rel] = groups
+        print(
+            f"{rel}\ttotal={len(files)}\tdup_groups={len(groups)}"
+            f"\textra_files={extra_files}\textra_bytes={extra_bytes}",
+            flush=True,
+        )
+        for group in groups[:3]:
+            print(
+                f"  keep={group.keeper.rel_to_mailbox}"
+                f"\tarchive={len(group.losers)}\tsize={group.size}"
+                f"\thash={group.hash_hex[:12]}",
+                flush=True,
+            )
+
+    print(
+        f"TOTAL\ttotal={total_files}\tdup_groups={total_dup_groups}"
+        f"\textra_files={total_extra_files}\textra_bytes={total_extra_bytes}",
+        flush=True,
+    )
+
+    if not args.apply:
+        return 0
+
+    batch_root = move_duplicates(root, archive_root, apply_plan)
+    print(f"ARCHIVED\t{batch_root}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
