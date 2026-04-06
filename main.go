@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,6 +63,13 @@ type NewMessage struct {
 	From    string
 }
 
+type PeekStrategy string
+
+const (
+	PeekStrategyUnseen PeekStrategy = "unseen"
+	PeekStrategyWindow PeekStrategy = "window"
+)
+
 var quiet bool
 var trace bool
 
@@ -78,6 +86,9 @@ func main() {
 	case "check":
 		runCheck(os.Args[2:])
 		return
+	case "peek":
+		runPeek(os.Args[2:])
+		return
 	case "sync":
 		runSync(os.Args[2:])
 		return
@@ -92,6 +103,7 @@ func printHelp() {
 
 Usage:
   mail3 check [options]
+  mail3 peek [options]
   mail3 sync [options]
   mail3 --help
 
@@ -100,6 +112,14 @@ Check options:
   -binary             Print 1 if any unread mail exists, otherwise 0
   -inbox-only         Only check INBOX for each account
   -account NAME       Only check a specific account (repeatable)
+
+Peek options:
+  -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
+  -strategy NAME      unread listing strategy: unseen or window (default unseen)
+  -limit N            Maximum messages to print per mailbox (default 10)
+  -inbox-only         Only inspect INBOX for each account
+  -count-first        Use STATUS UNSEEN before deeper unread probing
+  -account NAME       Only inspect a specific account (repeatable)
 
 Sync options:
   -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
@@ -204,6 +224,82 @@ func runSync(args []string) {
 		if len(unread) == 0 {
 			os.Exit(2)
 		}
+	}
+}
+
+func runPeek(args []string) {
+	fs := flag.NewFlagSet("peek", flag.ExitOnError)
+	var configPath string
+	var inboxOnly bool
+	var limit int
+	var strategy string
+	var countFirst bool
+	accountFilters := stringSlice{}
+	fs.StringVar(&configPath, "config", "", "config path")
+	fs.BoolVar(&inboxOnly, "inbox-only", false, "only inspect INBOX for each account")
+	fs.IntVar(&limit, "limit", 10, "maximum messages to print per mailbox")
+	fs.StringVar(&strategy, "strategy", string(PeekStrategyUnseen), "unread listing strategy")
+	fs.BoolVar(&countFirst, "count-first", false, "use STATUS UNSEEN before deeper unread probing")
+	fs.BoolVar(&trace, "trace", false, "print timing per mailbox to stderr")
+	fs.Var(&accountFilters, "account", "account name to inspect (repeatable)")
+	_ = fs.Parse(args)
+
+	if limit <= 0 {
+		fatalf("limit must be positive")
+	}
+
+	strategyName := PeekStrategy(strategy)
+	if strategyName != PeekStrategyUnseen && strategyName != PeekStrategyWindow {
+		fatalf("unknown peek strategy %q", strategy)
+	}
+
+	cfgPath := configPath
+	if cfgPath == "" {
+		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+		if xdgConfig == "" {
+			fatalf("XDG_CONFIG_HOME is not set; pass -config")
+		}
+		cfgPath = filepath.Join(xdgConfig, "mail3", "config.json")
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+
+	filters := make(map[string]bool)
+	for _, name := range accountFilters {
+		filters[name] = true
+	}
+
+	var unread []NewMessage
+	startAll := time.Now()
+	for _, acct := range cfg.Accounts {
+		if acct.Disabled {
+			continue
+		}
+		if len(filters) > 0 && !filters[acct.Name] {
+			continue
+		}
+		if inboxOnly {
+			acct.InboxOnly = true
+		}
+		startAcct := time.Now()
+		msgs, err := peekAccount(acct, strategyName, limit, countFirst)
+		if err != nil {
+			logf("account %s: %v", acct.Name, err)
+			continue
+		}
+		tracef("account %s: %s", acct.Name, time.Since(startAcct))
+		unread = append(unread, msgs...)
+	}
+	tracef("total: %s", time.Since(startAll))
+
+	for _, msg := range unread {
+		fmt.Printf("%s\t%s\t%v\t%s\t%s\n", msg.Account, msg.Mailbox, msg.UID, msg.From, msg.Subject)
+	}
+	if len(unread) == 0 {
+		os.Exit(2)
 	}
 }
 
@@ -824,4 +920,178 @@ func checkAccount(acct AccountConfig) ([]UnseenResult, error) {
 	}
 
 	return out, nil
+}
+
+func peekAccount(acct AccountConfig, strategy PeekStrategy, limit int, countFirst bool) ([]NewMessage, error) {
+	if acct.Address == "" || acct.Username == "" || acct.Host == "" || acct.Port == 0 {
+		return nil, fmt.Errorf("account %s: missing required fields", acct.Name)
+	}
+	if len(acct.PasswordCommand) == 0 {
+		return nil, fmt.Errorf("account %s: password_command is required", acct.Name)
+	}
+
+	pass, err := readPassword(acct.PasswordCommand)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := fmt.Sprintf("%s:%d", acct.Host, acct.Port)
+	tlsConfig := &tls.Config{ServerName: acct.Host}
+	c, err := client.DialTLS(addr, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Logout()
+
+	if err := c.Login(acct.Username, pass); err != nil {
+		return nil, err
+	}
+
+	excluded := make(map[string]bool)
+	for _, name := range acct.ExcludeMailboxes {
+		excluded[name] = true
+	}
+
+	mailboxes, err := listMailboxes(c, acct.InboxOnly, excluded)
+	if err != nil {
+		return nil, err
+	}
+
+	var unread []NewMessage
+	for _, mbox := range mailboxes {
+		startMbox := time.Now()
+		if countFirst {
+			status, err := c.Status(mbox.Name, []imap.StatusItem{imap.StatusUnseen})
+			if err != nil {
+				return nil, err
+			}
+			if status.Unseen == 0 {
+				tracef("peek %s/%s: skipped after status in %s", acct.Name, mbox.Name, time.Since(startMbox))
+				continue
+			}
+		}
+
+		msgs, err := peekMailbox(c, acct.Name, mbox.Name, strategy, limit)
+		if err != nil {
+			return nil, err
+		}
+		tracef("peek %s/%s: %s", acct.Name, mbox.Name, time.Since(startMbox))
+		unread = append(unread, msgs...)
+	}
+
+	return unread, nil
+}
+
+func peekMailbox(c *client.Client, accountName, mailboxName string, strategy PeekStrategy, limit int) ([]NewMessage, error) {
+	mbox, err := c.Select(mailboxName, true)
+	if err != nil {
+		return nil, err
+	}
+
+	switch strategy {
+	case PeekStrategyUnseen:
+		criteria := imap.NewSearchCriteria()
+		criteria.WithoutFlags = []string{imap.SeenFlag}
+		uids, err := c.UidSearch(criteria)
+		if err != nil {
+			return nil, err
+		}
+		return fetchPeekMessages(c, accountName, mailboxName, newestUIDs(uids, limit))
+	case PeekStrategyWindow:
+		if mbox.UidNext <= 1 {
+			return nil, nil
+		}
+		startUID := uint32(1)
+		if mbox.UidNext > uint32(limit) {
+			startUID = mbox.UidNext - uint32(limit)
+		}
+		var uids []uint32
+		for uid := startUID; uid < mbox.UidNext; uid++ {
+			uids = append(uids, uid)
+		}
+		msgs, err := fetchPeekMessages(c, accountName, mailboxName, uids)
+		if err != nil {
+			return nil, err
+		}
+		filtered := msgs[:0]
+		for _, msg := range msgs {
+			if msg.UID == 0 {
+				continue
+			}
+			filtered = append(filtered, msg)
+		}
+		return filtered, nil
+	default:
+		return nil, fmt.Errorf("unknown peek strategy %q", strategy)
+	}
+}
+
+func newestUIDs(uids []uint32, limit int) []uint32 {
+	if len(uids) == 0 {
+		return nil
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	if len(uids) > limit {
+		uids = uids[len(uids)-limit:]
+	}
+	return uids
+}
+
+func fetchPeekMessages(c *client.Client, accountName, mailboxName string, uids []uint32) ([]NewMessage, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uids...)
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, imap.FetchEnvelope}
+	messages := make(chan *imap.Message, len(uids))
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.UidFetch(seqset, items, messages)
+	}()
+
+	var out []NewMessage
+	for msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if hasSeen(msg.Flags) {
+			continue
+		}
+		out = append(out, NewMessage{
+			Account: accountName,
+			Mailbox: mailboxName,
+			UID:     msg.Uid,
+			From:    envelopeFrom(msg.Envelope),
+			Subject: envelopeSubject(msg.Envelope),
+		})
+	}
+
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
+	return out, nil
+}
+
+func envelopeSubject(env *imap.Envelope) string {
+	if env == nil || env.Subject == "" {
+		return ""
+	}
+	return env.Subject
+}
+
+func envelopeFrom(env *imap.Envelope) string {
+	if env == nil || len(env.From) == 0 || env.From[0] == nil {
+		return ""
+	}
+	addr := env.From[0]
+	email := addr.Address()
+	if addr.PersonalName == "" {
+		return email
+	}
+	return fmt.Sprintf("%q <%s>", addr.PersonalName, email)
 }
