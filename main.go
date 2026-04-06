@@ -98,6 +98,9 @@ func main() {
 	case "fetch":
 		runFetch(os.Args[2:])
 		return
+	case "write":
+		runWrite(os.Args[2:])
+		return
 	case "sync":
 		runSync(os.Args[2:])
 		return
@@ -115,6 +118,7 @@ Usage:
   mail3 fetch [options]
   mail3 peek [options]
   mail3 sync [options]
+  mail3 write [options]
   mail3 --help
 
 Check options:
@@ -136,6 +140,13 @@ Fetch options:
   -root PATH          Override root maildir path
   -input PATH         Read account/mailbox/uid rows from a file or - for stdin
   -account NAME       Only fetch rows for a specific account (repeatable)
+
+Write options:
+  -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
+  -account NAME       Account name
+  -mailbox NAME       Source mailbox name
+  -uid N              Message UID
+  -action NAME        Action: mark-read or delete
 
 Sync options:
   -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
@@ -376,6 +387,49 @@ func runFetch(args []string) {
 	}
 }
 
+func runWrite(args []string) {
+	fs := flag.NewFlagSet("write", flag.ExitOnError)
+	var configPath string
+	var accountName string
+	var mailboxName string
+	var action string
+	var uid uint
+	fs.StringVar(&configPath, "config", "", "config path")
+	fs.StringVar(&accountName, "account", "", "account name")
+	fs.StringVar(&mailboxName, "mailbox", "", "mailbox name")
+	fs.StringVar(&action, "action", "", "write action")
+	fs.UintVar(&uid, "uid", 0, "message uid")
+	fs.BoolVar(&trace, "trace", false, "print timing to stderr")
+	_ = fs.Parse(args)
+
+	if accountName == "" || mailboxName == "" || action == "" || uid == 0 {
+		fatalf("account, mailbox, uid, and action are required")
+	}
+
+	cfgPath := configPath
+	if cfgPath == "" {
+		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+		if xdgConfig == "" {
+			fatalf("XDG_CONFIG_HOME is not set; pass -config")
+		}
+		cfgPath = filepath.Join(xdgConfig, "mail3", "config.json")
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+
+	acct, err := findAccount(cfg, accountName)
+	if err != nil {
+		fatalf("write: %v", err)
+	}
+
+	if err := writeMessageAction(acct, mailboxName, uint32(uid), action); err != nil {
+		fatalf("write: %v", err)
+	}
+}
+
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	file, err := os.Open(path)
@@ -388,6 +442,18 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+func findAccount(cfg Config, name string) (AccountConfig, error) {
+	for _, acct := range cfg.Accounts {
+		if acct.Disabled {
+			continue
+		}
+		if acct.Name == name {
+			return acct, nil
+		}
+	}
+	return AccountConfig{}, fmt.Errorf("account %q not found", name)
 }
 
 func loadFetchTargets(path string, filters map[string]bool) ([]FetchTarget, error) {
@@ -581,6 +647,98 @@ func fetchAccountTargets(acct AccountConfig, rootMailDir string, mailboxes map[s
 	}
 
 	return nil
+}
+
+func writeMessageAction(acct AccountConfig, mailboxName string, uid uint32, action string) error {
+	if acct.Address == "" || acct.Username == "" || acct.Host == "" || acct.Port == 0 {
+		return fmt.Errorf("account %s: missing required fields", acct.Name)
+	}
+	if len(acct.PasswordCommand) == 0 {
+		return fmt.Errorf("account %s: password_command is required", acct.Name)
+	}
+
+	pass, err := readPassword(acct.PasswordCommand)
+	if err != nil {
+		return err
+	}
+
+	addr := fmt.Sprintf("%s:%d", acct.Host, acct.Port)
+	tlsConfig := &tls.Config{ServerName: acct.Host}
+	c, err := client.DialTLS(addr, tlsConfig)
+	if err != nil {
+		return err
+	}
+	defer c.Logout()
+
+	if err := c.Login(acct.Username, pass); err != nil {
+		return err
+	}
+
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uid)
+	start := time.Now()
+
+	switch action {
+	case "mark-read":
+		if _, err := c.Select(mailboxName, false); err != nil {
+			return err
+		}
+		item := imap.FormatFlagsOp(imap.AddFlags, true)
+		if err := c.UidStore(seqset, item, []interface{}{imap.SeenFlag}, nil); err != nil {
+			return err
+		}
+	case "delete":
+		if _, err := c.Select(mailboxName, false); err != nil {
+			return err
+		}
+		item := imap.FormatFlagsOp(imap.AddFlags, true)
+		if err := c.UidStore(seqset, item, []interface{}{imap.SeenFlag}, nil); err != nil {
+			return err
+		}
+		trashMailbox, err := findSpecialMailbox(c, imap.TrashAttr)
+		if err != nil {
+			return err
+		}
+		if trashMailbox == "" {
+			return fmt.Errorf("trash mailbox not found")
+		}
+		if err := c.UidMove(seqset, trashMailbox); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported action %q", action)
+	}
+
+	tracef("write %s/%s uid=%d action=%s: %s", acct.Name, mailboxName, uid, action, time.Since(start))
+	return nil
+}
+
+func findSpecialMailbox(c *client.Client, attr string) (string, error) {
+	mailboxes := make(chan *imap.MailboxInfo, 32)
+	done := make(chan error, 1)
+	var out string
+
+	go func() {
+		for mbox := range mailboxes {
+			if out != "" {
+				continue
+			}
+			for _, mailboxAttr := range mbox.Attributes {
+				if mailboxAttr == attr {
+					out = mbox.Name
+					break
+				}
+			}
+		}
+		done <- nil
+	}()
+
+	if err := c.List("", "*", mailboxes); err != nil {
+		<-done
+		return "", err
+	}
+	<-done
+	return out, nil
 }
 
 func listMailboxes(c *client.Client, inboxOnly bool, excluded map[string]bool) ([]MailboxInfo, error) {
