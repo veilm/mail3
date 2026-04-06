@@ -7,6 +7,7 @@ Minimal IMAP-to-Maildir puller using go-imap (same IMAP library aerc uses).
 - `mail3 check`
 - `mail3 check -binary`
 - `mail3 check -inbox-only`
+- `mail3 fetch -input /tmp/mail3-unread`
 - `mail3 peek -inbox-only -limit 10`
 - `mail3 peek -inbox-only -limit 10 -strategy unseen -count-first`
 - `mail3 peek -inbox-only -limit 10 -strategy window`
@@ -72,3 +73,4 @@ Fields:
 - `peek -strategy unseen` selects a mailbox, searches for unread UIDs, and fetches headers for the newest matching messages.
 - `peek -count-first` adds a STATUS UNSEEN pre-check before deeper unread probing, which can help when most mailboxes are empty.
 - `peek -strategy window` inspects only the last N UIDs in a mailbox and filters unread results from that window.
+- `fetch` reads `account<TAB>mailbox<TAB>uid` rows, fetches the full raw messages for those UIDs, and stores them in the local maildir without doing a full mailbox sync.

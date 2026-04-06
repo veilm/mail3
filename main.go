@@ -63,6 +63,12 @@ type NewMessage struct {
 	From    string
 }
 
+type FetchTarget struct {
+	Account string
+	Mailbox string
+	UID     uint32
+}
+
 type PeekStrategy string
 
 const (
@@ -89,6 +95,9 @@ func main() {
 	case "peek":
 		runPeek(os.Args[2:])
 		return
+	case "fetch":
+		runFetch(os.Args[2:])
+		return
 	case "sync":
 		runSync(os.Args[2:])
 		return
@@ -103,6 +112,7 @@ func printHelp() {
 
 Usage:
   mail3 check [options]
+  mail3 fetch [options]
   mail3 peek [options]
   mail3 sync [options]
   mail3 --help
@@ -120,6 +130,12 @@ Peek options:
   -inbox-only         Only inspect INBOX for each account
   -count-first        Use STATUS UNSEEN before deeper unread probing
   -account NAME       Only inspect a specific account (repeatable)
+
+Fetch options:
+  -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
+  -root PATH          Override root maildir path
+  -input PATH         Read account/mailbox/uid rows from a file or - for stdin
+  -account NAME       Only fetch rows for a specific account (repeatable)
 
 Sync options:
   -config PATH        Path to config.json (default $XDG_CONFIG_HOME/mail3/config.json)
@@ -303,6 +319,63 @@ func runPeek(args []string) {
 	}
 }
 
+func runFetch(args []string) {
+	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
+	var configPath string
+	var rootOverride string
+	var inputPath string
+	accountFilters := stringSlice{}
+	fs.StringVar(&configPath, "config", "", "config path")
+	fs.StringVar(&rootOverride, "root", "", "root maildir path override")
+	fs.StringVar(&inputPath, "input", "-", "path to account/mailbox/uid rows, or - for stdin")
+	fs.BoolVar(&trace, "trace", false, "print timing per mailbox to stderr")
+	fs.Var(&accountFilters, "account", "account name to fetch (repeatable)")
+	_ = fs.Parse(args)
+
+	cfgPath := configPath
+	if cfgPath == "" {
+		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
+		if xdgConfig == "" {
+			fatalf("XDG_CONFIG_HOME is not set; pass -config")
+		}
+		cfgPath = filepath.Join(xdgConfig, "mail3", "config.json")
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fatalf("load config: %v", err)
+	}
+
+	rootMailDir := cfg.Root
+	if rootOverride != "" {
+		rootMailDir = rootOverride
+	}
+	if rootMailDir == "" {
+		xdgData := os.Getenv("XDG_DATA_HOME")
+		if xdgData == "" {
+			fatalf("XDG_DATA_HOME is not set; pass -root or set root in config")
+		}
+		rootMailDir = filepath.Join(xdgData, "mail3")
+	}
+
+	filters := make(map[string]bool)
+	for _, name := range accountFilters {
+		filters[name] = true
+	}
+
+	targets, err := loadFetchTargets(inputPath, filters)
+	if err != nil {
+		fatalf("load targets: %v", err)
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	if err := fetchTargets(cfg, rootMailDir, targets); err != nil {
+		fatalf("fetch: %v", err)
+	}
+}
+
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	file, err := os.Open(path)
@@ -315,6 +388,51 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+func loadFetchTargets(path string, filters map[string]bool) ([]FetchTarget, error) {
+	var reader io.Reader
+	if path == "-" {
+		reader = os.Stdin
+	} else {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		reader = file
+	}
+
+	scanner := bufio.NewScanner(reader)
+	targets := make([]FetchTarget, 0)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("invalid target row %q", line)
+		}
+		account := strings.TrimSpace(fields[0])
+		if len(filters) > 0 && !filters[account] {
+			continue
+		}
+		mailbox := strings.TrimSpace(fields[1])
+		var uid uint32
+		if _, err := fmt.Sscanf(strings.TrimSpace(fields[2]), "%d", &uid); err != nil {
+			return nil, fmt.Errorf("invalid uid in row %q", line)
+		}
+		targets = append(targets, FetchTarget{
+			Account: account,
+			Mailbox: mailbox,
+			UID:     uid,
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return targets, nil
 }
 
 func syncAccount(acct AccountConfig, rootMailDir string, dryRun bool) ([]NewMessage, error) {
@@ -387,6 +505,82 @@ func syncAccount(acct AccountConfig, rootMailDir string, dryRun bool) ([]NewMess
 	}
 
 	return unread, nil
+}
+
+func fetchTargets(cfg Config, rootMailDir string, targets []FetchTarget) error {
+	accountMap := make(map[string]AccountConfig, len(cfg.Accounts))
+	for _, acct := range cfg.Accounts {
+		if acct.Disabled {
+			continue
+		}
+		accountMap[acct.Name] = acct
+	}
+
+	grouped := make(map[string]map[string][]uint32)
+	for _, target := range targets {
+		if _, ok := accountMap[target.Account]; !ok {
+			return fmt.Errorf("unknown account %q", target.Account)
+		}
+		mboxes := grouped[target.Account]
+		if mboxes == nil {
+			mboxes = make(map[string][]uint32)
+			grouped[target.Account] = mboxes
+		}
+		mboxes[target.Mailbox] = append(mboxes[target.Mailbox], target.UID)
+	}
+
+	for accountName, mailboxes := range grouped {
+		acct := accountMap[accountName]
+		startAcct := time.Now()
+		if err := fetchAccountTargets(acct, rootMailDir, mailboxes); err != nil {
+			return err
+		}
+		tracef("fetch account %s: %s", acct.Name, time.Since(startAcct))
+	}
+
+	return nil
+}
+
+func fetchAccountTargets(acct AccountConfig, rootMailDir string, mailboxes map[string][]uint32) error {
+	if acct.Address == "" || acct.Username == "" || acct.Host == "" || acct.Port == 0 {
+		return fmt.Errorf("account %s: missing required fields", acct.Name)
+	}
+	if len(acct.PasswordCommand) == 0 {
+		return fmt.Errorf("account %s: password_command is required", acct.Name)
+	}
+
+	pass, err := readPassword(acct.PasswordCommand)
+	if err != nil {
+		return err
+	}
+
+	addr := fmt.Sprintf("%s:%d", acct.Host, acct.Port)
+	tlsConfig := &tls.Config{ServerName: acct.Host}
+	c, err := client.DialTLS(addr, tlsConfig)
+	if err != nil {
+		return err
+	}
+	defer c.Logout()
+
+	if err := c.Login(acct.Username, pass); err != nil {
+		return err
+	}
+
+	acctRoot := filepath.Join(rootMailDir, acct.Address)
+	if err := os.MkdirAll(acctRoot, 0o700); err != nil {
+		return err
+	}
+
+	for mailboxName, uids := range mailboxes {
+		startMbox := time.Now()
+		mailboxPath := mailboxPath(acctRoot, mailboxName, "/")
+		if err := fetchMailboxUIDs(c, acct.Name, mailboxName, mailboxPath, uids); err != nil {
+			return err
+		}
+		tracef("fetch mailbox %s/%s: %s", acct.Name, mailboxName, time.Since(startMbox))
+	}
+
+	return nil
 }
 
 func listMailboxes(c *client.Client, inboxOnly bool, excluded map[string]bool) ([]MailboxInfo, error) {
@@ -527,6 +721,90 @@ func syncMailbox(c *client.Client, name, path string, dryRun bool, state *State)
 	state.Mailboxes[name] = mboxState
 	tracef("mailbox %s: fetched_bytes=%d", name, bytesFetched)
 	return unread, nil
+}
+
+func fetchMailboxUIDs(c *client.Client, accountName, mailboxName, path string, uids []uint32) error {
+	if len(uids) == 0 {
+		return nil
+	}
+
+	mbox, err := c.Select(mailboxName, true)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if err := maildir.Dir(path).Init(); err != nil {
+		return err
+	}
+
+	uniq := uniqueSortedUIDs(uids)
+	section := &imap.BodySectionName{Peek: true}
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, section.FetchItem()}
+
+	const batchSize = 50
+	var bytesFetched int64
+	for i := 0; i < len(uniq); i += batchSize {
+		end := i + batchSize
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		seqset := new(imap.SeqSet)
+		seqset.AddNum(uniq[i:end]...)
+
+		messages := make(chan *imap.Message, batchSize)
+		done := make(chan error, 1)
+		go func() {
+			done <- c.UidFetch(seqset, items, messages)
+		}()
+
+		for msg := range messages {
+			if msg == nil {
+				continue
+			}
+			reader := msg.GetBody(section)
+			if reader == nil {
+				continue
+			}
+			counter := &countingReader{r: reader}
+			key, subject, from, err := writeMessage(path, counter, msg.Flags)
+			if err != nil {
+				return fmt.Errorf("%s/%s uid %d: %w", accountName, mailboxName, msg.Uid, err)
+			}
+			if err := replaceIndexedMessage(path, mbox.UidValidity, msg.Uid, key); err != nil {
+				return fmt.Errorf("%s/%s uid %d: %w", accountName, mailboxName, msg.Uid, err)
+			}
+			bytesFetched += counter.n
+			fmt.Printf("%s\t%s\t%v\t%s\t%s\n", accountName, mailboxName, msg.Uid, from, subject)
+		}
+
+		if err := <-done; err != nil {
+			return err
+		}
+	}
+
+	tracef("fetch mailbox %s/%s: fetched_bytes=%d", accountName, mailboxName, bytesFetched)
+	return nil
+}
+
+func uniqueSortedUIDs(uids []uint32) []uint32 {
+	if len(uids) == 0 {
+		return nil
+	}
+	out := append([]uint32(nil), uids...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	n := 0
+	var prev uint32
+	for i, uid := range out {
+		if i > 0 && uid == prev {
+			continue
+		}
+		out[n] = uid
+		n++
+		prev = uid
+	}
+	return out[:n]
 }
 
 func hasSeen(flags []string) bool {
